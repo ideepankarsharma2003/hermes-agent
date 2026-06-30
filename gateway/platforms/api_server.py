@@ -543,7 +543,12 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Idempotency-Key, "
+        "X-Hermes-Runtime-Provider, X-Hermes-Runtime-Model, "
+        "X-Hermes-Runtime-Api-Key, X-Hermes-Runtime-Base-Url, "
+        "X-Hermes-Runtime-Api-Mode"
+    ),
 }
 
 
@@ -982,6 +987,48 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    def _parse_runtime_override_headers(
+        self,
+        request: "web.Request",
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Read trusted per-request runtime overrides from authenticated callers.
+
+        This is intended for first-party control planes that own provider
+        credentials outside the Hermes container. The caller must already have
+        passed API_SERVER_KEY auth before these headers are considered.
+        """
+        header_map = {
+            "X-Hermes-Runtime-Provider": "provider",
+            "X-Hermes-Runtime-Model": "model",
+            "X-Hermes-Runtime-Api-Key": "api_key",
+            "X-Hermes-Runtime-Base-Url": "base_url",
+            "X-Hermes-Runtime-Api-Mode": "api_mode",
+        }
+        override: Dict[str, Any] = {}
+        for header, key in header_map.items():
+            raw = request.headers.get(header)
+            if raw is None:
+                continue
+            if len(raw) > 16_384 or re.search(r"[\r\n\x00]", raw):
+                return None, web.json_response(
+                    _openai_error(f"Invalid {header} header", code="invalid_runtime_override"),
+                    status=400,
+                )
+            value = raw.strip()
+            if value:
+                override[key] = value
+        if not override:
+            return None, None
+        if not self._api_key:
+            return None, web.json_response(
+                _openai_error(
+                    "Runtime override headers require API key authentication.",
+                    code="runtime_override_requires_auth",
+                ),
+                status=403,
+            )
+        return override, None
+
     # ------------------------------------------------------------------
     # Session header helpers
     # ------------------------------------------------------------------
@@ -1078,6 +1125,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        runtime_override: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1104,9 +1152,30 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         from hermes_cli.tools_config import _get_platform_tools
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
+        if runtime_override and runtime_override.get("api_key"):
+            runtime_kwargs = {
+                "api_key": runtime_override.get("api_key"),
+                "base_url": runtime_override.get("base_url"),
+                "provider": runtime_override.get("provider") or "openai",
+                "api_mode": runtime_override.get("api_mode") or "chat_completions",
+                "command": None,
+                "args": [],
+                "credential_pool": None,
+                "max_tokens": None,
+            }
+            model = runtime_override.get("model") or _resolve_gateway_model()
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            model = _resolve_gateway_model()
+        if runtime_override and not runtime_override.get("api_key"):
+            runtime_kwargs = dict(runtime_kwargs)
+            for key in ("api_key", "base_url", "provider", "api_mode"):
+                value = runtime_override.get(key)
+                if value:
+                    runtime_kwargs[key] = value
+            if runtime_override.get("model"):
+                model = runtime_override["model"]
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -1831,6 +1900,10 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        runtime_override, runtime_err = self._parse_runtime_override_headers(request)
+        if runtime_err is not None:
+            return runtime_err
+
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -2029,6 +2102,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                runtime_override=runtime_override,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2048,6 +2122,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                runtime_override=runtime_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3774,6 +3849,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        runtime_override: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3805,6 +3881,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
+                    runtime_override=runtime_override,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
@@ -3925,6 +4002,10 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        runtime_override, runtime_err = self._parse_runtime_override_headers(request)
+        if runtime_err is not None:
+            return runtime_err
+
         raw_input = body.get("input")
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
@@ -4024,6 +4105,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
+                    runtime_override=runtime_override,
                 )
                 self._active_run_agents[run_id] = agent
 
