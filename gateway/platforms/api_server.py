@@ -62,6 +62,32 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+_RUNTIME_PROVIDER_ALIASES = {
+    "openai": "openai-api",
+    "openai_api": "openai-api",
+    "openaiapi": "openai-api",
+    "codex": "openai-codex",
+}
+
+
+def _normalize_runtime_override_provider(provider: Optional[str]) -> str:
+    normalized = (provider or "openai-api").strip().lower()
+    return _RUNTIME_PROVIDER_ALIASES.get(normalized, normalized)
+
+
+def _default_runtime_base_url(provider: str) -> Optional[str]:
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        if pconfig and pconfig.inference_base_url:
+            return str(pconfig.inference_base_url).strip().rstrip("/") or None
+    except Exception:
+        pass
+    if provider == "openai-api":
+        return "https://api.openai.com/v1"
+    return None
+
 
 def _hermes_version() -> str:
     """Return the hermes-agent version string, or "dev" if it can't be resolved.
@@ -1154,11 +1180,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         reasoning_config = GatewayRunner._load_reasoning_config()
         if runtime_override and runtime_override.get("api_key"):
+            provider = _normalize_runtime_override_provider(runtime_override.get("provider"))
+            base_url = runtime_override.get("base_url") or _default_runtime_base_url(provider)
             runtime_kwargs = {
                 "api_key": runtime_override.get("api_key"),
-                "base_url": runtime_override.get("base_url"),
-                "provider": runtime_override.get("provider") or "openai",
-                "api_mode": runtime_override.get("api_mode") or "chat_completions",
+                "base_url": base_url,
+                "provider": provider,
+                "api_mode": runtime_override.get("api_mode") or None,
                 "command": None,
                 "args": [],
                 "credential_pool": None,
